@@ -11,9 +11,9 @@
 # Without sudo it still runs, but the connection-tracking table and which program owns
 # each port need root, so the report has less to go on.
 #
-# What it sends to attack.frabs.net: the network interface's packet and byte counters and
-# the kernel's TCP, UDP and ICMP counters every two seconds; incoming connections counted
-# by state, by local port and by remote address; the local ports that are listening and
+# What it sends to attack.frabs.net, live while it watches: the network interface's packet
+# and byte counters and the kernel's TCP, UDP and ICMP counters every two seconds; every
+# ten seconds, incoming connections counted by state, by local port and by remote address; the local ports that are listening and
 # the name of the program on each. Never this server's hostname or its own addresses (its
 # own connections out are left out), packet contents, file contents or command lines.
 
@@ -49,6 +49,51 @@ pairs() { awk 'BEGIN { printf "[" } $2 ~ /^[0-9A-Fa-f:.|a-z]+$/ { printf "%s[\"%
 # The address part of an ss address ("1.2.3.4:80", "[2001:db8::1]:443", "::ffff:1.2.3.4:22").
 peer() { awk '{ a = $0; sub(/:[0-9*]+$/, "", a); gsub(/[][]/, "", a); sub(/^::ffff:/, "", a); sub(/%.*/, "", a); print a }'; }
 port() { awk '{ n = split($0, p, ":"); print p[n] }'; }
+
+snapshot() {
+  # Incoming connections right now, counted: by state, by remote address, by local port, and the
+  # connection-tracking table (root). Run every 10 seconds while watching, and once at the end.
+  # This server's own addresses, so its own connections out (to updates, APIs) are never counted as visitors,
+  # and its addresses are never sent. Kept in the temporary folder only.
+  { ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'; echo 127.0.0.1; echo ::1; } > "$WORK/self"
+  if has ss; then
+    ss -Htan 2>/dev/null > "$WORK/tcp"
+    # Only connections coming in: those to a port this server listens on.
+    awk '$1 == "LISTEN" { n = split($4, a, ":"); print a[n] }' "$WORK/tcp" | sort -u > "$WORK/lports"
+    awk 'NR == FNR { l[$1] = 1; next } $1 != "LISTEN" { n = split($4, a, ":"); if (a[n] in l) print }' "$WORK/lports" "$WORK/tcp" > "$WORK/tcp_in"
+    states=$(awk '{ print $1 }' "$WORK/tcp_in" | sort | uniq -c | awk 'BEGIN { printf "[" } { printf "%s[\"%s\",%d]", (n++ ? "," : ""), $2, $1 } END { printf "]" }')
+    remotes=$(awk '{ print $5 }' "$WORK/tcp_in" | peer | awk 'NR == FNR { s[$1] = 1; next } !($1 in s)' "$WORK/self" - | sort | uniq -c | sort -rn | head -40 | pairs)
+    synrecv=$(awk '$1 == "SYN-RECV" { print $5 }' "$WORK/tcp_in" | peer | sort | uniq -c | sort -rn | head -20 | pairs)
+    synrecv_n=$(awk '$1 == "SYN-RECV"' "$WORK/tcp_in" | wc -l)
+    lports=$(awk '{ print $4 }' "$WORK/tcp_in" | port | sort | uniq -c | sort -rn | head -20 | pairs)
+    send "{\"tcp\":{\"states\":$states,\"remotes\":$remotes,\"synrecv\":$synrecv,\"synrecv_total\":$synrecv_n,\"local_ports\":$lports}}"
+  fi
+  # The connection-tracking table (root): flows by source, by destination port and by source port.
+  ct=""
+  if [ $ROOT = yes ]; then
+    if [ -r /proc/net/nf_conntrack ]; then ct=/proc/net/nf_conntrack
+    elif has conntrack; then conntrack -L 2>/dev/null > "$WORK/ct" && ct="$WORK/ct"; fi
+  fi
+  if [ -n "$ct" ]; then
+    head -n 300000 "$ct" | awk '{ p = ""; s = ""; sp = ""; dp = ""
+        for (i = 1; i <= NF; i++) {
+          if (p == "" && ($i == "tcp" || $i == "udp" || $i == "icmp" || $i == "icmpv6")) p = $i
+          if (s == "" && $i ~ /^src=/) s = substr($i, 5)
+          if (sp == "" && $i ~ /^sport=/) sp = substr($i, 7)
+          if (dp == "" && $i ~ /^dport=/) dp = substr($i, 7)
+        }
+        if (p == "") next
+        print p, s, sp, dp }' | awk 'NR == FNR { self[$1] = 1; next } !($2 in self)' "$WORK/self" - > "$WORK/flows"
+    total=$(wc -l < "$WORK/flows")
+    by_src=$(awk '{ print $1 "|" $2 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -40 | pairs)
+    by_dport=$(awk '$4 != "" { print $1 "|" $4 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -20 | pairs)
+    by_sport=$(awk '$1 == "udp" && $3 != "" { print "udp|" $3 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -15 | pairs)
+    by_proto=$(awk '{ print $1 }' "$WORK/flows" | sort | uniq -c | pairs)
+    distinct=$(awk '{ print $2 }' "$WORK/flows" | sort -u | wc -l)
+    cmax=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+    send "{\"conntrack\":{\"total\":$total,\"max\":${cmax:-0},\"sources\":$distinct,\"by_proto\":$by_proto,\"by_source\":$by_src,\"by_dport\":$by_dport,\"by_udp_sport\":$by_sport}}"
+  fi
+}
 
 main() {
   CODE=$1
@@ -93,7 +138,7 @@ main() {
   i=0; batch=""
   while [ $i -le 30 ]; do
     c=$(counters); batch="${batch:+$batch,}$c"
-    if [ $((i % 5)) -eq 0 ]; then send "{\"samples\":[$batch]}"; batch=""; fi
+    if [ $((i % 5)) -eq 0 ]; then send "{\"samples\":[$batch]}"; batch=""; [ $i -gt 0 ] && [ $i -lt 30 ] && snapshot; fi
     i=$((i + 1)); [ $i -le 30 ] && sleep 2
   done
   [ -n "$batch" ] && send "{\"samples\":[$batch]}"
@@ -101,46 +146,7 @@ main() {
 
   # ---- connections right now: by state, by remote address, by local port
   step connections running "Reading connections"
-  # This server's own addresses, so its own connections out (to updates, APIs) are never counted as visitors,
-  # and its addresses are never sent. Kept in the temporary folder only.
-  { ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'; echo 127.0.0.1; echo ::1; } > "$WORK/self"
-  if has ss; then
-    ss -Htan 2>/dev/null > "$WORK/tcp"
-    # Only connections coming in: those to a port this server listens on.
-    awk '$1 == "LISTEN" { n = split($4, a, ":"); print a[n] }' "$WORK/tcp" | sort -u > "$WORK/lports"
-    awk 'NR == FNR { l[$1] = 1; next } $1 != "LISTEN" { n = split($4, a, ":"); if (a[n] in l) print }' "$WORK/lports" "$WORK/tcp" > "$WORK/tcp_in"
-    states=$(awk '{ print $1 }' "$WORK/tcp_in" | sort | uniq -c | awk 'BEGIN { printf "[" } { printf "%s[\"%s\",%d]", (n++ ? "," : ""), $2, $1 } END { printf "]" }')
-    remotes=$(awk '{ print $5 }' "$WORK/tcp_in" | peer | awk 'NR == FNR { s[$1] = 1; next } !($1 in s)' "$WORK/self" - | sort | uniq -c | sort -rn | head -40 | pairs)
-    synrecv=$(awk '$1 == "SYN-RECV" { print $5 }' "$WORK/tcp_in" | peer | sort | uniq -c | sort -rn | head -20 | pairs)
-    synrecv_n=$(awk '$1 == "SYN-RECV"' "$WORK/tcp_in" | wc -l)
-    lports=$(awk '{ print $4 }' "$WORK/tcp_in" | port | sort | uniq -c | sort -rn | head -20 | pairs)
-    send "{\"tcp\":{\"states\":$states,\"remotes\":$remotes,\"synrecv\":$synrecv,\"synrecv_total\":$synrecv_n,\"local_ports\":$lports}}"
-  fi
-  # The connection-tracking table (root): flows by source, by destination port and by source port.
-  ct=""
-  if [ $ROOT = yes ]; then
-    if [ -r /proc/net/nf_conntrack ]; then ct=/proc/net/nf_conntrack
-    elif has conntrack; then conntrack -L 2>/dev/null > "$WORK/ct" && ct="$WORK/ct"; fi
-  fi
-  if [ -n "$ct" ]; then
-    head -n 300000 "$ct" | awk '{ p = ""; s = ""; sp = ""; dp = ""
-        for (i = 1; i <= NF; i++) {
-          if (p == "" && ($i == "tcp" || $i == "udp" || $i == "icmp" || $i == "icmpv6")) p = $i
-          if (s == "" && $i ~ /^src=/) s = substr($i, 5)
-          if (sp == "" && $i ~ /^sport=/) sp = substr($i, 7)
-          if (dp == "" && $i ~ /^dport=/) dp = substr($i, 7)
-        }
-        if (p == "") next
-        print p, s, sp, dp }' | awk 'NR == FNR { self[$1] = 1; next } !($2 in self)' "$WORK/self" - > "$WORK/flows"
-    total=$(wc -l < "$WORK/flows")
-    by_src=$(awk '{ print $1 "|" $2 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -40 | pairs)
-    by_dport=$(awk '$4 != "" { print $1 "|" $4 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -20 | pairs)
-    by_sport=$(awk '$1 == "udp" && $3 != "" { print "udp|" $3 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -15 | pairs)
-    by_proto=$(awk '{ print $1 }' "$WORK/flows" | sort | uniq -c | pairs)
-    distinct=$(awk '{ print $2 }' "$WORK/flows" | sort -u | wc -l)
-    cmax=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
-    send "{\"conntrack\":{\"total\":$total,\"max\":${cmax:-0},\"sources\":$distinct,\"by_proto\":$by_proto,\"by_source\":$by_src,\"by_dport\":$by_dport,\"by_udp_sport\":$by_sport}}"
-  fi
+  snapshot
   step connections done "Reading connections"
 
   # ---- what is listening, and which program (the name only)
