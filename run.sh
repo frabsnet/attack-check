@@ -12,10 +12,10 @@
 # each port need root, so the report has less to go on.
 #
 # What it sends to attack.frabs.net: the network interface's packet and byte counters and
-# the kernel's TCP, UDP and ICMP counters every two seconds; the number of connections by
-# state, by local port and by remote address; the local ports that are listening and the
-# name of the program on each. Never this server's hostname or its own addresses, packet
-# contents, file contents or command lines.
+# the kernel's TCP, UDP and ICMP counters every two seconds; incoming connections counted
+# by state, by local port and by remote address; the local ports that are listening and
+# the name of the program on each. Never this server's hostname or its own addresses (its
+# own connections out are left out), packet contents, file contents or command lines.
 
 API="https://api.frabs.net/v1/tools/attack"
 LC_ALL=C; export LC_ALL
@@ -101,13 +101,19 @@ main() {
 
   # ---- connections right now: by state, by remote address, by local port
   step connections running "Reading connections"
+  # This server's own addresses, so its own connections out (to updates, APIs) are never counted as visitors,
+  # and its addresses are never sent. Kept in the temporary folder only.
+  { ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'; echo 127.0.0.1; echo ::1; } > "$WORK/self"
   if has ss; then
     ss -Htan 2>/dev/null > "$WORK/tcp"
-    states=$(awk '{ print $1 }' "$WORK/tcp" | sort | uniq -c | awk 'BEGIN { printf "[" } { printf "%s[\"%s\",%d]", (n++ ? "," : ""), $2, $1 } END { printf "]" }')
-    remotes=$(awk '$1 != "LISTEN" { print $5 }' "$WORK/tcp" | peer | sort | uniq -c | sort -rn | head -40 | pairs)
-    synrecv=$(awk '$1 == "SYN-RECV" { print $5 }' "$WORK/tcp" | peer | sort | uniq -c | sort -rn | head -20 | pairs)
-    synrecv_n=$(awk '$1 == "SYN-RECV"' "$WORK/tcp" | wc -l)
-    lports=$(awk '$1 != "LISTEN" { print $4 }' "$WORK/tcp" | port | sort | uniq -c | sort -rn | head -20 | pairs)
+    # Only connections coming in: those to a port this server listens on.
+    awk '$1 == "LISTEN" { n = split($4, a, ":"); print a[n] }' "$WORK/tcp" | sort -u > "$WORK/lports"
+    awk 'NR == FNR { l[$1] = 1; next } $1 != "LISTEN" { n = split($4, a, ":"); if (a[n] in l) print }' "$WORK/lports" "$WORK/tcp" > "$WORK/tcp_in"
+    states=$(awk '{ print $1 }' "$WORK/tcp_in" | sort | uniq -c | awk 'BEGIN { printf "[" } { printf "%s[\"%s\",%d]", (n++ ? "," : ""), $2, $1 } END { printf "]" }')
+    remotes=$(awk '{ print $5 }' "$WORK/tcp_in" | peer | awk 'NR == FNR { s[$1] = 1; next } !($1 in s)' "$WORK/self" - | sort | uniq -c | sort -rn | head -40 | pairs)
+    synrecv=$(awk '$1 == "SYN-RECV" { print $5 }' "$WORK/tcp_in" | peer | sort | uniq -c | sort -rn | head -20 | pairs)
+    synrecv_n=$(awk '$1 == "SYN-RECV"' "$WORK/tcp_in" | wc -l)
+    lports=$(awk '{ print $4 }' "$WORK/tcp_in" | port | sort | uniq -c | sort -rn | head -20 | pairs)
     send "{\"tcp\":{\"states\":$states,\"remotes\":$remotes,\"synrecv\":$synrecv,\"synrecv_total\":$synrecv_n,\"local_ports\":$lports}}"
   fi
   # The connection-tracking table (root): flows by source, by destination port and by source port.
@@ -125,7 +131,7 @@ main() {
           if (dp == "" && $i ~ /^dport=/) dp = substr($i, 7)
         }
         if (p == "") next
-        print p, s, sp, dp }' > "$WORK/flows"
+        print p, s, sp, dp }' | awk 'NR == FNR { self[$1] = 1; next } !($2 in self)' "$WORK/self" - > "$WORK/flows"
     total=$(wc -l < "$WORK/flows")
     by_src=$(awk '{ print $1 "|" $2 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -40 | pairs)
     by_dport=$(awk '$4 != "" { print $1 "|" $4 }' "$WORK/flows" | sort | uniq -c | sort -rn | head -20 | pairs)
