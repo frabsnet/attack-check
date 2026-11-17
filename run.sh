@@ -135,13 +135,21 @@ main() {
 
   # ---- 60 seconds of counters, every two seconds, sent five at a time
   step watch running "Watching traffic for 60 seconds"
+  # A countdown on the terminal, one second at a time (60, 59, 58...), worked out from the clock.
+  t0=$(date +%s)
+  tick() {
+    [ -t 1 ] || return 0
+    left=$((60 - ($(date +%s) - t0))); [ $left -lt 0 ] && left=0
+    printf '\r  %-36s %3ss ' "Watching traffic for 60 seconds" "$left"
+  }
   i=0; batch=""
   while [ $i -le 30 ]; do
     c=$(counters); batch="${batch:+$batch,}$c"
     if [ $((i % 5)) -eq 0 ]; then send "{\"samples\":[$batch]}"; batch=""; [ $i -gt 0 ] && [ $i -lt 30 ] && snapshot; fi
-    i=$((i + 1)); [ $i -le 30 ] && sleep 2
+    i=$((i + 1)); [ $i -le 30 ] && { tick; sleep 1; tick; sleep 1; }
   done
   [ -n "$batch" ] && send "{\"samples\":[$batch]}"
+  [ -t 1 ] && printf '\r  %-36s ' "Watching traffic for 60 seconds"
   step watch done "Watching traffic for 60 seconds"
 
   # ---- connections right now: by state, by remote address, by local port
